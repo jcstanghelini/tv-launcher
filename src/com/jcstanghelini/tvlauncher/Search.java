@@ -1,0 +1,770 @@
+package com.jcstanghelini.tvlauncher;
+
+import android.app.SearchManager;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
+import android.net.Uri;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Search data: titles from JustWatch (every service in India, with each service's link) and
+ * Stremio's Cinemeta catalogue, plus the generic matching of a streaming service to the app that
+ * plays it. Nothing here touches views; network calls block and run off the UI thread.
+ */
+final class Search {
+
+    static final String K_TITLES = "search_titles", K_RECENT = "search_recent", K_APP = "search_app_";
+    static final String JW_IMG = "https://images.justwatch.com";
+    static final int MAX_TITLES = 20, MAX_RECENT = 8;
+
+    /** One way to watch a title: a service, how it is offered, and its links. */
+    static final class Offer {
+        String service = "", tech = "", monetization = "", web = "", deeplink = "", icon = "";
+        /** The app that plays it ("" when none is installed) and the app to get otherwise. */
+        String pkg = "", getPkg = "";
+
+        boolean installed() {
+            return !pkg.isEmpty();
+        }
+
+        /** Subscription first, then free, rent and buy (lower is better). */
+        int rank() {
+            switch (monetization) {
+                case "FLATRATE": return 0;
+                case "FREE": return 1;
+                case "ADS": return 2;
+                case "RENT": return 3;
+                case "BUY": return 4;
+                default: return 5;
+            }
+        }
+
+        String label() {
+            switch (monetization) {
+                case "FLATRATE": return "Subscription";
+                case "FREE": return "Free";
+                case "ADS": return "Free with ads";
+                case "RENT": return "Rent";
+                case "BUY": return "Buy";
+                case "STREMIO": return "Add-ons";
+                default: return "";
+            }
+        }
+    }
+
+    static final class Title {
+        String title = "", type = "movie", year = "", overview = "", genres = "", poster = "", backdrop = "", imdb = "";
+        double rating;
+        /** One offer per app, best first (installed apps, then subscription before rent/buy). */
+        List<Offer> offers = new ArrayList<>();
+    }
+
+    static SharedPreferences prefs(Context c) {
+        return Suggestions.prefs(c);
+    }
+
+    static boolean titlesEnabled(Context c) {
+        return prefs(c).getBoolean(K_TITLES, true);
+    }
+
+    // ------------------------------------------------------------------ recent searches
+
+    /** This profile's recent searches, newest first. */
+    static List<String> recent(Context c) {
+        List<String> out = new ArrayList<>();
+        try {
+            JSONArray a = new JSONArray(Profiles.homePrefs(c).getString(K_RECENT, "[]"));
+            for (int i = 0; i < a.length(); i++) out.add(a.getString(i));
+        } catch (Exception ignored) {
+        }
+        return out;
+    }
+
+    static void remember(Context c, String q) {
+        q = q.trim();
+        if (q.length() < 2) return;
+        List<String> r = recent(c);
+        for (int i = r.size() - 1; i >= 0; i--) if (r.get(i).equalsIgnoreCase(q)) r.remove(i);
+        r.add(0, q);
+        JSONArray a = new JSONArray();
+        for (int i = 0; i < Math.min(MAX_RECENT, r.size()); i++) a.put(r.get(i));
+        Profiles.homePrefs(c).edit().putString(K_RECENT, a.toString()).apply();
+    }
+
+    static void clearRecent(Context c) {
+        Profiles.homePrefs(c).edit().remove(K_RECENT).apply();
+    }
+
+    // ------------------------------------------------------------------ text matching
+
+    /** Lower case, letters and digits only (so "Sony LIV" == "sonyliv"). */
+    static String norm(String s) {
+        StringBuilder b = new StringBuilder();
+        for (char ch : s.toLowerCase(Locale.ROOT).toCharArray()) if (Character.isLetterOrDigit(ch)) b.append(ch);
+        return b.toString();
+    }
+
+    /**
+     * How well a name matches what was typed: 0 starts with it, 1 a word starts with it,
+     * 2 contains it, 3 a keyword starts with it; -1 no match.
+     */
+    static int score(String name, String keywords, String q) {
+        String n = name.toLowerCase(Locale.ROOT), query = q.toLowerCase(Locale.ROOT).trim();
+        if (query.isEmpty()) return -1;
+        if (n.startsWith(query) || norm(n).startsWith(norm(query))) return 0;
+        for (String w : n.split("[^\\p{L}\\p{N}]+")) if (!w.isEmpty() && w.startsWith(query)) return 1;
+        if (norm(n).contains(norm(query)) && norm(query).length() >= 2) return 2;
+        if (keywords != null) for (String k : keywords.split(" ")) if (k.startsWith(query)) return 3;
+        return -1;
+    }
+
+    // ------------------------------------------------------------------ titles
+
+    static final String JW_SEARCH = "query S($q: String!, $first: Int!, $country: Country!, $lang: Language!) {"
+            + " popularTitles(country: $country, first: $first, filter: {searchQuery: $q}) { edges { node { objectType"
+            + " content(country: $country, language: $lang) { title originalReleaseYear shortDescription"
+            + " posterUrl(profile: S332, format: JPG) backdrops(profile: S1440, format: JPG) { backdropUrl }"
+            + " genres { translation(language: $lang) } externalIds { imdbId } scoring { imdbScore } }"
+            + " offers(country: $country, platform: WEB) { monetizationType standardWebURL deeplinkURL(platform: ANDROID_TV)"
+            + " package { clearName technicalName icon(profile: S100, format: PNG) } } } } } }";
+
+    /** Titles matching q on installed streaming apps in the active region (JustWatch), best match first. */
+    static List<Title> titles(Context c, String q, Apps apps) throws Exception {
+        List<String> countries = HomeDashboard.getEffectiveReleasesCountries(c);
+        String country = (countries != null && !countries.isEmpty())
+                ? countries.get(0) : HomeDashboard.defaultCountryForUiLang(c);
+        if (country == null || country.trim().isEmpty()) country = "US";
+        country = country.trim().toUpperCase(Locale.US);
+        if ("AZ".equals(country)) country = "TR";
+
+        String lang = I18n.getLang(c);
+        if ("az".equals(lang)) lang = "tr";
+        if (lang != null && lang.contains("-")) lang = lang.substring(0, lang.indexOf('-'));
+        if (lang == null || lang.length() != 2) lang = "en";
+
+        JSONObject vars = new JSONObject()
+                .put("q", q)
+                .put("first", MAX_TITLES)
+                .put("country", country)
+                .put("lang", lang);
+        JSONObject res = post("https://apis.justwatch.com/graphql",
+                new JSONObject().put("query", JW_SEARCH).put("variables", vars).toString());
+        JSONArray edges = res.getJSONObject("data").getJSONObject("popularTitles").getJSONArray("edges");
+        List<Title> out = new ArrayList<>();
+        for (int i = 0; i < edges.length(); i++) {
+            JSONObject n = edges.getJSONObject(i).getJSONObject("node");
+            JSONObject ct = n.optJSONObject("content");
+            if (ct == null) continue;
+            Title t = new Title();
+            t.title = ct.optString("title");
+            t.type = "SHOW".equals(n.optString("objectType")) ? "tv" : "movie";
+            int y = ct.optInt("originalReleaseYear");
+            t.year = y > 0 ? String.valueOf(y) : "";
+            t.overview = clean(ct.optString("shortDescription"));
+            String poster = clean(ct.optString("posterUrl"));
+            if (!poster.isEmpty()) t.poster = JW_IMG + poster;
+            JSONArray bd = ct.optJSONArray("backdrops");
+            if (bd != null && bd.length() > 0) t.backdrop = JW_IMG + bd.getJSONObject(0).optString("backdropUrl");
+            JSONArray g = ct.optJSONArray("genres");
+            List<String> gn = new ArrayList<>();
+            for (int j = 0; g != null && j < g.length() && gn.size() < 2; j++) gn.add(g.getJSONObject(j).optString("translation"));
+            t.genres = android.text.TextUtils.join(", ", gn);
+            JSONObject ids = ct.optJSONObject("externalIds");
+            if (ids != null) t.imdb = clean(ids.optString("imdbId"));
+            JSONObject sc = ct.optJSONObject("scoring");
+            if (sc != null) t.rating = sc.optDouble("imdbScore", 0);
+            if (Double.isNaN(t.rating)) t.rating = 0;
+            JSONArray offers = n.optJSONArray("offers");
+            List<Offer> raw = new ArrayList<>();
+            for (int j = 0; offers != null && j < offers.length(); j++) {
+                JSONObject o = offers.getJSONObject(j);
+                JSONObject p = o.optJSONObject("package");
+                if (p == null) continue;
+                Offer of = new Offer();
+                of.service = tidyService(p.optString("clearName"));
+                of.tech = p.optString("technicalName");
+                of.monetization = o.optString("monetizationType");
+                of.web = clean(o.optString("standardWebURL"));
+                of.deeplink = clean(o.optString("deeplinkURL"));
+                String icon = clean(p.optString("icon"));
+                of.icon = icon.isEmpty() ? "" : JW_IMG + icon;
+                raw.add(of);
+            }
+            t.offers = group(c, raw, apps);
+            if (!t.imdb.isEmpty()) addStremio(c, t);
+            if (!t.offers.isEmpty()) out.add(t);
+        }
+        return out;
+    }
+
+    /**
+     * Stremio's catalogue search (Cinemeta), for titles JustWatch doesn't list. Only used when
+     * Stremio or Nuvio is installed, since those are the only apps that can open them.
+     */
+    static List<Title> stremio(Context c, String q) throws Exception {
+        List<Title> out = new ArrayList<>();
+        String enc = URLEncoder.encode(q, "UTF-8").replace("+", "%20");
+        for (String kind : new String[]{"movie", "series"}) {
+            JSONObject res = get("https://v3-cinemeta.strem.io/catalog/" + kind + "/top/search=" + enc + ".json");
+            JSONArray metas = res.optJSONArray("metas");
+            for (int i = 0; metas != null && i < metas.length() && i < 10; i++) {
+                JSONObject m = metas.getJSONObject(i);
+                String id = m.optString("id");
+                if (!id.startsWith("tt")) continue;
+                Title t = new Title();
+                t.title = m.optString("name");
+                t.type = kind.equals("series") ? "tv" : "movie";
+                String yr = m.optString("releaseInfo", m.optString("year"));
+                t.year = yr.length() >= 4 ? yr.substring(0, 4) : "";
+                t.overview = m.optString("description");
+                t.poster = m.optString("poster");
+                t.backdrop = m.optString("background");
+                t.imdb = id;
+                t.rating = m.optDouble("imdbRating", 0);
+                if (Double.isNaN(t.rating)) t.rating = 0;
+                JSONArray g = m.optJSONArray("genres");
+                List<String> gn = new ArrayList<>();
+                for (int j = 0; g != null && j < g.length() && gn.size() < 2; j++) gn.add(g.optString(j));
+                t.genres = android.text.TextUtils.join(", ", gn);
+                addStremio(c, t);
+                out.add(t);
+            }
+        }
+        return out;
+    }
+
+    static boolean hasStremioApp(Context c) {
+        return Suggestions.installed(c, Suggestions.STREMIO.pkg) || NuvioCloud.installedApp(c) != null;
+    }
+
+    /** Offer.icon prefix for an installed app's own launcher icon instead of a logo URL. */
+    static final String APP_ICON = "app:";
+
+    /** "Open in Stremio" / "Open in Nuvio" / "Open in Nuvio Legacy" by IMDb id, after the services: one per installed app. */
+    static void addStremio(Context c, Title t) {
+        for (Suggestions.Provider p : Suggestions.stremioApps(c)) {
+            Offer o = new Offer();
+            o.service = p.name;
+            o.icon = APP_ICON + p.pkg;
+            o.tech = "stremio";
+            o.monetization = "STREMIO";
+            o.pkg = p.pkg;
+            t.offers.add(o);
+        }
+    }
+
+    static String tidyService(String s) {
+        return s.replace(" Free with Ads", "").replace(" with Ads", "").replace(" Amazon Channel", "").trim();
+    }
+
+    static String clean(String s) {
+        return s == null || s.equals("null") ? "" : s;
+    }
+
+    // ------------------------------------------------------------------ services -> apps
+
+    /** The installed launcher apps, by normalised label, and the browsers to ignore as handlers. */
+    static final class Apps {
+        final Map<String, String> byLabel = new LinkedHashMap<>();
+        final Set<String> browsers = new HashSet<>();
+    }
+
+    static Apps apps(Context c, Map<String, MainActivity.AppEntry> all) {
+        RESOLVED.clear();
+        Apps a = new Apps();
+        for (MainActivity.AppEntry e : all.values()) {
+            if (e.pkg != null && e.launch != null && !e.key.startsWith("special:")) a.byLabel.put(norm(e.label), e.pkg);
+        }
+        // Whatever opens an ordinary website is a browser (or the TV's "no browser" stub), not the service's app.
+        PackageManager pm = c.getPackageManager();
+        for (ResolveInfo r : pm.queryIntentActivities(new Intent(Intent.ACTION_VIEW, Uri.parse("https://www.example.com/")), 0)) {
+            a.browsers.add(r.activityInfo.packageName);
+        }
+        return a;
+    }
+
+    /**
+     * One offer per app, best first. Each offer's app is found generically, without a list of
+     * services: the app named in JustWatch's Android TV link, an installed app that opens the
+     * service's website, the app remembered from last time, or an installed app with the same name.
+     */
+    static List<Offer> group(Context c, List<Offer> raw, Apps apps) {
+        Map<String, Offer> best = new LinkedHashMap<>();
+        for (Offer o : raw) {
+            resolve(c, o, apps);
+            if (!o.installed()) continue;
+            String key = !o.pkg.isEmpty() ? o.pkg : !o.getPkg.isEmpty() ? o.getPkg : norm(o.service);
+            Offer cur = best.get(key);
+            if (cur == null || o.rank() < cur.rank()) best.put(key, o);
+        }
+        List<Offer> out = new ArrayList<>(best.values());
+        java.util.Collections.sort(out, (x, y) -> x.installed() != y.installed() ? (x.installed() ? -1 : 1) : Integer.compare(x.rank(), y.rank()));
+        return out;
+    }
+
+    /** Service -> "app|app to get", for the life of one search screen (apps may be installed in between). */
+    static final Map<String, String> RESOLVED = java.util.Collections.synchronizedMap(new HashMap<>());
+
+    static void resolve(Context c, Offer o, Apps apps) {
+        String memo = RESOLVED.get(o.tech);
+        if (memo != null) {
+            String[] p = memo.split("\\|", -1);
+            o.pkg = p[0];
+            o.getPkg = p[1];
+            return;
+        }
+        PackageManager pm = c.getPackageManager();
+        String named = "";
+        if (!o.deeplink.isEmpty()) {
+            try {
+                Intent i = Intent.parseUri(o.deeplink, Intent.URI_INTENT_SCHEME);
+                if (i.getPackage() != null) named = i.getPackage();
+                if (named.isEmpty()) {
+                    ResolveInfo r = pm.resolveActivity(i, 0);
+                    if (r != null && !apps.browsers.contains(r.activityInfo.packageName)) named = r.activityInfo.packageName;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        if (!named.isEmpty() && Suggestions.installed(c, named)) o.pkg = named;
+        if (o.pkg.isEmpty() && !o.web.isEmpty()) {
+            ResolveInfo r = pm.resolveActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(o.web)), 0);
+            if (r != null && !apps.browsers.contains(r.activityInfo.packageName)
+                    && !"android".equals(r.activityInfo.packageName)) o.pkg = r.activityInfo.packageName;
+        }
+        if (o.pkg.isEmpty()) {
+            String saved = prefs(c).getString(K_APP + o.tech, "");
+            if (!saved.isEmpty() && Suggestions.installed(c, saved)) o.pkg = saved;
+        }
+        if (o.pkg.isEmpty()) o.pkg = byName(o.service, apps);
+        if (o.pkg.isEmpty()) {
+            // Known services from the recommendations list, by JustWatch's own technical name.
+            for (Suggestions.Provider p : Suggestions.PROVIDERS) {
+                if (p.jwTech.equals(o.tech) && Suggestions.installed(c, p.pkg)) o.pkg = p.pkg;
+            }
+        }
+        if (!o.pkg.isEmpty()) prefs(c).edit().putString(K_APP + o.tech, o.pkg).apply();
+        o.getPkg = o.pkg.isEmpty() ? named : o.pkg;
+        if (o.getPkg.isEmpty()) {
+            for (Suggestions.Provider p : Suggestions.PROVIDERS) if (p.jwTech.equals(o.tech)) o.getPkg = p.pkg;
+        }
+        RESOLVED.put(o.tech, o.pkg + "|" + o.getPkg);
+    }
+
+    /** An installed app whose name matches the service's ("Sony Liv" ~ "Sony LIV", "Zee5" ~ "ZEE5"). */
+    static String byName(String service, Apps apps) {
+        String s = norm(service);
+        if (s.length() < 3) return "";
+        String hit = apps.byLabel.get(s);
+        if (hit != null) return hit;
+        for (Map.Entry<String, String> e : apps.byLabel.entrySet()) {
+            String l = e.getKey();
+            if (l.length() >= 3 && (l.startsWith(s) || s.startsWith(l))) return e.getValue();
+        }
+        return "";
+    }
+
+    // ------------------------------------------------------------------ opening
+
+    /**
+     * Opens the title in the offer's app as directly as it allows: the title's page on the
+     * service (in the app), JustWatch's Android TV link, the app's own search, or the app itself.
+     */
+    static void open(Context c, Title t, Offer o) {
+        if (o.monetization.equals("STREMIO")) {
+            Suggestions.Item it = new Suggestions.Item();
+            it.type = t.type;
+            it.link = t.imdb;
+            it.providerId = Suggestions.STREMIO_ID;
+            Suggestions.openStremio(c, it, Suggestions.stremioAppFor(c, o.pkg));
+            return;
+        }
+        PackageManager pm = c.getPackageManager();
+        List<Intent> tries = new ArrayList<>();
+        if (!o.web.isEmpty()) tries.add(Suggestions.view(o.web, o.pkg));
+        if (!o.deeplink.isEmpty()) {
+            try {
+                Intent i = Intent.parseUri(o.deeplink, Intent.URI_INTENT_SCHEME);
+                i.setSelector(null);
+                i.setComponent(null);
+                i.setPackage(o.pkg);
+                tries.add(i);
+            } catch (Exception ignored) {
+            }
+        }
+        tries.add(new Intent(Intent.ACTION_SEARCH).setPackage(o.pkg).putExtra(SearchManager.QUERY, t.title));
+        for (Intent i : tries) {
+            if (i.resolveActivity(pm) != null && Suggestions.start(c, i)) return;
+        }
+        Intent launch = pm.getLeanbackLaunchIntentForPackage(o.pkg);
+        if (launch == null) launch = pm.getLaunchIntentForPackage(o.pkg);
+        if (launch != null) Suggestions.start(c, launch);
+    }
+
+    /** The service's app on the Play Store: its exact page when the app is known, else a search for it. */
+    static void get(Context c, Offer o) {
+        Uri u = !o.getPkg.isEmpty() ? Uri.parse("market://details?id=" + o.getPkg)
+                : Uri.parse("market://search?q=" + Uri.encode(o.service) + "&c=apps");
+        if (!Suggestions.start(c, new Intent(Intent.ACTION_VIEW, u))) {
+            Suggestions.start(c, new Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/search?q="
+                    + Uri.encode(o.service) + "&c=apps")));
+        }
+    }
+
+    // ------------------------------------------------------------------ http
+
+    /** The connection in flight, so a newer search can cut it off at once. */
+    static volatile HttpURLConnection current;
+
+    static void cancel() {
+        HttpURLConnection con = current;
+        if (con != null) con.disconnect();
+    }
+
+    static JSONObject post(String url, String body) throws Exception {
+        HttpURLConnection con = (HttpURLConnection) new URL(url).openConnection();
+        con.setConnectTimeout(4000);
+        con.setReadTimeout(6000);
+        con.setRequestMethod("POST");
+        con.setDoOutput(true);
+        con.setRequestProperty("Content-Type", "application/json");
+        current = con;
+        try {
+            con.getOutputStream().write(body.getBytes(StandardCharsets.UTF_8));
+            if (con.getResponseCode() != 200) throw new IllegalStateException("HTTP " + con.getResponseCode());
+            return new JSONObject(new String(Suggestions.readAll(con.getInputStream()), StandardCharsets.UTF_8));
+        } finally {
+            con.disconnect();
+        }
+    }
+
+    static JSONObject get(String url) throws Exception {
+        HttpURLConnection con = (HttpURLConnection) new URL(url).openConnection();
+        con.setConnectTimeout(4000);
+        con.setReadTimeout(6000);
+        try {
+            if (con.getResponseCode() != 200) throw new IllegalStateException("HTTP " + con.getResponseCode());
+            return new JSONObject(new String(Suggestions.readAll(con.getInputStream()), StandardCharsets.UTF_8));
+        } finally {
+            con.disconnect();
+        }
+    }
+
+    // ------------------------------------------------------------------ in-app search & providers
+
+    static final class AppSearchEntry {
+        String pkg = "", label = "", deepLinkPrefix = "";
+    }
+
+    static final class AppSearchTarget {
+        String pkg = "", label = "", deepLinkUrl = "", query = "";
+    }
+
+    static final class InAppResult {
+        String pkg = "", appName = "", title = "", subtitle = "", art = "";
+        String intentAction = "", intentData = "", intentExtra = "";
+    }
+
+    private static final String[][] KNOWN_SEARCH_APPS = {
+        {"com.google.android.youtube.tv", "YouTube", "https://www.youtube.com/results?search_query="},
+        {"org.smarttube.stable", "SmartTube", "https://www.youtube.com/results?search_query="},
+        {"com.liskovsoft.smarttubetv.beta", "SmartTube", "https://www.youtube.com/results?search_query="},
+        {"com.teamsmart.videomanager.tv", "SmartTube", "https://www.youtube.com/results?search_query="},
+        {"com.netflix.ninja", "Netflix", "https://www.netflix.com/search?q="},
+        {"com.netflix.mediaclient", "Netflix", "https://www.netflix.com/search?q="},
+        {"com.spotify.tv.android", "Spotify", "spotify:search:"},
+        {"com.spotify.music", "Spotify", "spotify:search:"},
+        {"com.amazon.amazonvideo.livingroom", "Prime Video", ""},
+        {"com.amazon.avod.thirdpartyclient", "Prime Video", ""},
+        {"com.disney.disneyplus", "Disney+", ""},
+        {"in.startv.hotstar", "Disney+", ""},
+        {"tv.twitch.android.app", "Twitch", "twitch://search?query="},
+        {"tv.twitch.android.viewer", "Twitch", "twitch://search?query="},
+        {"com.stremio.one", "Stremio", "stremio:///search?search="},
+        {"com.stremio.tv", "Stremio", "stremio:///search?search="},
+        {"com.android.vending", "Google Play", "market://search?q="}
+    };
+
+    static List<AppSearchEntry> discoverSearchableApps(Context c) {
+        List<AppSearchEntry> out = new ArrayList<>();
+        if (c == null) return out;
+        PackageManager pm = c.getPackageManager();
+        Set<String> seenPkgs = new HashSet<>();
+        String myPkg = c.getPackageName();
+
+        for (String[] row : KNOWN_SEARCH_APPS) {
+            String pkg = row[0];
+            if (seenPkgs.contains(pkg) || !Suggestions.installed(c, pkg)) continue;
+            seenPkgs.add(pkg);
+            AppSearchEntry e = new AppSearchEntry();
+            e.pkg = pkg;
+            e.label = resolveAppLabel(pm, pkg, row[1]);
+            e.deepLinkPrefix = row[2];
+            out.add(e);
+        }
+
+        try {
+            List<ResolveInfo> list = pm.queryIntentActivities(new Intent(Intent.ACTION_SEARCH), 0);
+            if (list != null) {
+                for (ResolveInfo ri : list) {
+                    if (ri.activityInfo == null || ri.activityInfo.packageName == null) continue;
+                    String pkg = ri.activityInfo.packageName;
+                    if (seenPkgs.contains(pkg) || pkg.equals(myPkg)
+                            || pkg.startsWith("com.android.cts")
+                            || pkg.equals("com.google.android.gms")
+                            || pkg.equals("com.google.android.katniss")
+                            || pkg.equals("com.android.settings")) {
+                        continue;
+                    }
+                    if (pm.getLeanbackLaunchIntentForPackage(pkg) == null
+                            && pm.getLaunchIntentForPackage(pkg) == null) {
+                        continue;
+                    }
+                    seenPkgs.add(pkg);
+                    AppSearchEntry e = new AppSearchEntry();
+                    e.pkg = pkg;
+                    CharSequence lbl = ri.loadLabel(pm);
+                    e.label = (lbl != null && lbl.length() > 0) ? lbl.toString() : resolveAppLabel(pm, pkg, pkg);
+                    e.deepLinkPrefix = "";
+                    out.add(e);
+                }
+            }
+        } catch (Throwable ignored) { }
+
+        return out;
+    }
+
+    static List<AppSearchTarget> appSearchTargets(List<AppSearchEntry> entries, String q) {
+        List<AppSearchTarget> out = new ArrayList<>();
+        if (entries == null || entries.isEmpty() || q == null) return out;
+        String trimmed = q.trim();
+        if (trimmed.isEmpty()) return out;
+
+        String enc;
+        try {
+            enc = URLEncoder.encode(trimmed, "UTF-8").replace("+", "%20");
+        } catch (Exception e) {
+            enc = trimmed;
+        }
+
+        for (AppSearchEntry entry : entries) {
+            AppSearchTarget t = new AppSearchTarget();
+            t.pkg = entry.pkg;
+            t.label = entry.label;
+            t.deepLinkUrl = entry.deepLinkPrefix.isEmpty() ? "" : (entry.deepLinkPrefix + enc);
+            t.query = trimmed;
+            out.add(t);
+        }
+        return out;
+    }
+
+    static List<AppSearchTarget> appSearchTargets(Context c, String q) {
+        return appSearchTargets(discoverSearchableApps(c), q);
+    }
+
+    private static String resolveAppLabel(PackageManager pm, String pkg, String fallback) {
+        try {
+            CharSequence l = pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0));
+            if (l != null && l.length() > 0) return l.toString();
+        } catch (Throwable ignored) { }
+        return fallback;
+    }
+
+    static boolean openAppSearch(MainActivity a, AppSearchTarget t) {
+        if (a == null || t == null || t.pkg.isEmpty()) return false;
+        remember(a, t.query);
+        a.prepareForAppLaunch();
+
+        if (!t.deepLinkUrl.isEmpty()) {
+            try {
+                Intent view = new Intent(Intent.ACTION_VIEW, Uri.parse(t.deepLinkUrl)).setPackage(t.pkg);
+                if (Suggestions.start(a, view)) {
+                    a.overridePendingTransition(R.anim.app_open_enter, R.anim.app_open_exit);
+                    return true;
+                }
+            } catch (Throwable ignored) { }
+        }
+
+        try {
+            Intent search = new Intent(Intent.ACTION_SEARCH)
+                    .setPackage(t.pkg)
+                    .putExtra(SearchManager.QUERY, t.query);
+            if (Suggestions.start(a, search)) {
+                a.overridePendingTransition(R.anim.app_open_enter, R.anim.app_open_exit);
+                return true;
+            }
+        } catch (Throwable ignored) { }
+
+        try {
+            PackageManager pm = a.getPackageManager();
+            Intent launch = pm.getLeanbackLaunchIntentForPackage(t.pkg);
+            if (launch == null) launch = pm.getLaunchIntentForPackage(t.pkg);
+            if (launch != null && Suggestions.start(a, launch)) {
+                a.overridePendingTransition(R.anim.app_open_enter, R.anim.app_open_exit);
+                return true;
+            }
+        } catch (Throwable ignored) { }
+
+        return false;
+    }
+
+    static List<InAppResult> queryAppSearchProviders(Context c, String q, int maxTotal) {
+        List<InAppResult> out = new ArrayList<>();
+        if (c == null || q == null || q.trim().isEmpty() || maxTotal <= 0) return out;
+        String trimmed = q.trim();
+        try {
+            SearchManager sm = (SearchManager) c.getSystemService(Context.SEARCH_SERVICE);
+            if (sm == null) return out;
+            List<android.app.SearchableInfo> searchables = sm.getSearchablesInGlobalSearch();
+            if (searchables == null || searchables.isEmpty()) return out;
+
+            PackageManager pm = c.getPackageManager();
+            String myPkg = c.getPackageName();
+            Set<String> seenKeys = new HashSet<>();
+
+            for (android.app.SearchableInfo si : searchables) {
+                if (out.size() >= maxTotal || si == null) continue;
+                String auth = si.getSuggestAuthority();
+                if (auth == null || auth.isEmpty()) continue;
+                String pkg = si.getSearchActivity() != null ? si.getSearchActivity().getPackageName() : "";
+                if (pkg.isEmpty() || pkg.equals(myPkg)
+                        || pkg.startsWith("com.android.cts")
+                        || pkg.equals("com.google.android.gms")
+                        || pkg.equals("com.android.vending")
+                        || pkg.equals("com.google.android.katniss")
+                        || pkg.startsWith("com.android.providers")) {
+                    continue;
+                }
+                String appName = resolveAppLabel(pm, pkg, pkg);
+                android.database.Cursor cur = null;
+                try {
+                    Uri.Builder b = new Uri.Builder()
+                            .scheme("content")
+                            .authority(auth);
+                    String path = si.getSuggestPath();
+                    if (path != null && !path.isEmpty()) {
+                        b.appendEncodedPath(path.startsWith("/") ? path.substring(1) : path);
+                    }
+                    b.appendPath(SearchManager.SUGGEST_URI_PATH_QUERY);
+                    String sel = si.getSuggestSelection();
+                    String[] selArgs = null;
+                    if (sel == null) {
+                        b.appendPath(trimmed);
+                    } else {
+                        selArgs = new String[]{trimmed};
+                    }
+                    b.appendQueryParameter(SearchManager.SUGGEST_PARAMETER_LIMIT, "8");
+
+                    cur = c.getContentResolver().query(b.build(), null, sel, selArgs, null);
+                    if (cur != null) {
+                        int count = 0;
+                        while (cur.moveToNext() && count < 8 && out.size() < maxTotal) {
+                            String title = colStr(cur, SearchManager.SUGGEST_COLUMN_TEXT_1);
+                            if (title.isEmpty()) continue;
+                            String dedup = pkg + "|" + title.toLowerCase(Locale.ROOT);
+                            if (!seenKeys.add(dedup)) continue;
+
+                            InAppResult r = new InAppResult();
+                            r.pkg = pkg;
+                            r.appName = appName;
+                            r.title = title;
+                            r.subtitle = colStr(cur, SearchManager.SUGGEST_COLUMN_TEXT_2);
+                            r.art = colStr(cur, SearchManager.SUGGEST_COLUMN_RESULT_CARD_IMAGE);
+                            if (r.art.isEmpty()) r.art = colStr(cur, SearchManager.SUGGEST_COLUMN_ICON_1);
+                            r.intentAction = colStr(cur, SearchManager.SUGGEST_COLUMN_INTENT_ACTION);
+                            if (r.intentAction.isEmpty()) {
+                                r.intentAction = si.getSuggestIntentAction() != null ? si.getSuggestIntentAction() : "";
+                            }
+                            if (r.intentAction.isEmpty()) r.intentAction = Intent.ACTION_VIEW;
+
+                            String d = colStr(cur, SearchManager.SUGGEST_COLUMN_INTENT_DATA);
+                            if (d.isEmpty() && si.getSuggestIntentData() != null) d = si.getSuggestIntentData();
+                            String did = colStr(cur, SearchManager.SUGGEST_COLUMN_INTENT_DATA_ID);
+                            if (!did.isEmpty()) {
+                                r.intentData = d.isEmpty() ? did : (d.endsWith("/") ? d + did : d + "/" + did);
+                            } else {
+                                r.intentData = d;
+                            }
+                            r.intentExtra = colStr(cur, SearchManager.SUGGEST_COLUMN_INTENT_EXTRA_DATA);
+                            out.add(r);
+                            count++;
+                        }
+                    }
+                } catch (Throwable ignored) {
+                } finally {
+                    if (cur != null) {
+                        try { cur.close(); } catch (Throwable ignored) { }
+                    }
+                }
+            }
+        } catch (Throwable ignored) { }
+        return out;
+    }
+
+    private static String colStr(android.database.Cursor c, String col) {
+        try {
+            int idx = c.getColumnIndex(col);
+            if (idx >= 0 && !c.isNull(idx)) {
+                String s = c.getString(idx);
+                return s != null ? s.trim() : "";
+            }
+        } catch (Throwable ignored) { }
+        return "";
+    }
+
+    static boolean openInAppResult(MainActivity a, InAppResult r) {
+        if (a == null || r == null || r.pkg.isEmpty()) return false;
+        a.prepareForAppLaunch();
+
+        try {
+            String action = r.intentAction.isEmpty() ? Intent.ACTION_VIEW : r.intentAction;
+            Intent intent = new Intent(action);
+            if (!r.intentData.isEmpty()) {
+                intent.setData(Uri.parse(r.intentData));
+            }
+            if (!r.intentExtra.isEmpty()) {
+                intent.putExtra(SearchManager.EXTRA_DATA_KEY, r.intentExtra);
+            }
+            intent.setPackage(r.pkg);
+            if (Suggestions.start(a, intent)) {
+                a.overridePendingTransition(R.anim.app_open_enter, R.anim.app_open_exit);
+                return true;
+            }
+            intent.setPackage(null);
+            if (Suggestions.start(a, intent)) {
+                a.overridePendingTransition(R.anim.app_open_enter, R.anim.app_open_exit);
+                return true;
+            }
+        } catch (Throwable ignored) { }
+
+        try {
+            PackageManager pm = a.getPackageManager();
+            Intent launch = pm.getLeanbackLaunchIntentForPackage(r.pkg);
+            if (launch == null) launch = pm.getLaunchIntentForPackage(r.pkg);
+            if (launch != null && Suggestions.start(a, launch)) {
+                a.overridePendingTransition(R.anim.app_open_enter, R.anim.app_open_exit);
+                return true;
+            }
+        } catch (Throwable ignored) { }
+
+        return false;
+    }
+}

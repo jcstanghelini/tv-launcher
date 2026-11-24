@@ -1,0 +1,68 @@
+name: Build APK
+
+# Push to main: builds a test APK (download it from the run's Artifacts).
+# Push a tag like v2.2.5.1: builds, signs and publishes a GitHub Release, which the
+# launcher's auto-updater picks up on the TV.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK packages
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;34.0.0" "platforms;android-34" > /dev/null
+
+      - name: Version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "VERSION_NAME=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            echo "VERSION_NAME=2.2.5.0-dev${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+          fi
+          echo "VERSION_CODE=$((1000 + GITHUB_RUN_NUMBER))" >> "$GITHUB_ENV"
+
+      - name: Release key
+        env:
+          SIGNING_PASS: ${{ secrets.SIGNING_PASS }}
+        run: |
+          if [ -z "$SIGNING_PASS" ]; then
+            echo "::warning::SIGNING_PASS secret missing, building with a throwaway debug key"
+            exit 0
+          fi
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in signing/release.jks.enc \
+            -out "$RUNNER_TEMP/release.jks" -pass env:SIGNING_PASS
+          echo "RELEASE_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
+      - name: Build
+        env:
+          RELEASE_KEYSTORE_PASS: ${{ secrets.SIGNING_PASS }}
+        run: bash build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: casa-tv-${{ env.VERSION_NAME }}
+          path: build/tvos-home.apk
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ -n "${RELEASE_KEYSTORE:-}" ] || { echo "Releases must be signed with the release key"; exit 1; }
+          gh release create "$GITHUB_REF_NAME" build/tvos-home.apk \
+            --title "Casa TV $GITHUB_REF_NAME" --notes-file CHANGES_CASA.md
