@@ -1,12 +1,14 @@
 name: Build APK
 
 # Push to main: builds a test APK (download it from the run's Artifacts).
-# Push a tag like v2.2.5.1: builds, signs and publishes a GitHub Release, which the
-# launcher's auto-updater picks up on the TV.
+# Publishing a GitHub Release with a tag like v2.2.5.1 (Releases > Draft a new release):
+# builds, signs and attaches the APK to that release, which the launcher's auto-updater
+# picks up on the TV.
 on:
   push:
     branches: [main]
-    tags: ['v*']
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -16,9 +18,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -29,7 +31,7 @@ jobs:
 
       - name: Version
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+          if [ "$GITHUB_EVENT_NAME" = "release" ]; then
             echo "VERSION_NAME=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
           else
             echo "VERSION_NAME=2.2.5.0-dev${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
@@ -58,11 +60,10 @@ jobs:
           name: casa-tv-${{ env.VERSION_NAME }}
           path: build/tvos-home.apk
 
-      - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Attach APK to the release
+        if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           [ -n "${RELEASE_KEYSTORE:-}" ] || { echo "Releases must be signed with the release key"; exit 1; }
-          gh release create "$GITHUB_REF_NAME" build/tvos-home.apk \
-            --title "Casa TV $GITHUB_REF_NAME" --notes-file CHANGES_CASA.md
+          gh release upload "$GITHUB_REF_NAME" build/tvos-home.apk --clobber
